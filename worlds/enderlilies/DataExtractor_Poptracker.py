@@ -25,7 +25,7 @@ class ParsingTreeNode:
         return self.parent.get_depth() + 1
 
 def rule_to_lua(rule: str, caller=None, logic_tokens=[]) -> str:
-    global macros, item_aliases, nodes_aliases, region_aliases, connections
+    global macros, item_aliases, nodes_aliases, region_aliases, nodes_connection_path
 
     # Tokenization
     if len(logic_tokens) == 0:
@@ -46,18 +46,18 @@ def rule_to_lua(rule: str, caller=None, logic_tokens=[]) -> str:
         elif token in macros:
             lua_rule += f"{convert_macro_name(token)}()"
         elif token in nodes_aliases:
-            lua_rule += f'getLocAccess("@{token}")'
+            lua_rule += f'getLocAccess("{nodes_connection_path[token]}")'
         elif token in item_aliases:
             lua_rule += f'has("{item_aliases[token]}")'
         elif token in region_aliases:
-            lua_rule += f'getLocAccess("@{token}")'
+            lua_rule += f'getLocAccess("{nodes_connection_path[token]}")'
         else:
             lua_rule += f"s.has('{token}', p) -- error"
 
     return lua_rule
 
 def rule_to_lua2(tree_node:ParsingTreeNode, caller:str) -> str:
-    global macros, item_aliases, nodes_aliases, region_aliases, connections
+    global macros, item_aliases, nodes_aliases, region_aliases, nodes_connection_path
 
     lua_rule = ""
 
@@ -77,14 +77,14 @@ def rule_to_lua2(tree_node:ParsingTreeNode, caller:str) -> str:
             if token in macros:
                 lua_rule += f"{convert_macro_name(token)}_A()"
             elif token in nodes_aliases:
-                lua_rule += f'getAccess("@{token}")'
+                lua_rule += f'getAccess("{nodes_connection_path[token]}")'
             elif token in item_aliases:
                 lua_rule += f'getAccess("{item_aliases[token]}")'
             elif token.split(',')[0] in item_aliases:
                 split_token = token.split(',')
                 lua_rule += f'getAccess("{item_aliases[split_token[0]]}", {split_token[1]})'
             elif token in region_aliases:
-                lua_rule += f'getAccess("@{token}")'
+                lua_rule += f'getAccess("{nodes_connection_path[token]}")'
             else:
                 print(f"Error while parsing token {token} for function {caller}")
                 lua_rule += f"getAccess('{token}') -- error"
@@ -245,6 +245,9 @@ if __name__ == "__main__":
     # Put all poptracker's location json in this folder to convert them
     locations_folder_path   = "worlds/enderlilies/tools/output/locations"
 
+
+    ########################## FILL IN DATA ##########################
+
     with open(json_path, "r") as f:
         data = json.load(f)
 
@@ -256,19 +259,17 @@ if __name__ == "__main__":
     special_names = {key:value for key, value in pop_data["special_names"].items()}
     missing_connections = {key:value for key, value in pop_data["missing_connections"].items()}
     additional_rules = {key:value for key, value in pop_data["additional_rules"].items()}
+    nodes_connection_path = {key:value for key, value in pop_data["nodes_connection_path"].items()}
 
-    item_aliases = {}
+    item_aliases = {alias:item for alias, item in pop_data["items_alias"].items()}
     nodes_aliases = {}
     region_aliases = {}
 
     connections = {}
-    reverse_tags = {}
+    reverse_tags = {tag:alias for alias, tag in data["tags"].items()}
     reverse_nodes = {}
 
-    macros : Dict[str, any] = {}
-
-    for alias, item in pop_data["items_alias"].items():
-        item_aliases[alias] = item
+    macros : Dict[str, any] = {name:rule for name, rule in data["macros"].items()}
 
     for alias, node in data["nodes_alias"].items():
         if node.startswith("Map."):
@@ -282,9 +283,6 @@ if __name__ == "__main__":
             region_aliases[name1] = None
         if not name2 in region_aliases:
             region_aliases[name2] = None
-
-    for alias, tag in data["tags"].items():
-        reverse_tags[tag] = alias
 
     # Find connections
     for node_name, node in data["nodes"].items():
@@ -310,6 +308,9 @@ if __name__ == "__main__":
 
     for name, rule in data["macros"].items():
         macros[name] = rule
+
+    
+    ######################## FILL IN LOCATIONS #######################
 
     locs = {}
 
@@ -341,115 +342,193 @@ if __name__ == "__main__":
             else:
                 locs[d.key] = name
 
+    
+    ######################## OUTPUT GENERATORS #######################
+
+    def create_generated_lua():
+        with open(generated_lua_path, "w") as generated_lua:
+            print(f"--[ Logic was generated from DataExtractor script, see https://github.com/3Reki/EnderLilies.Archipelago/tree/PoptrackerExporter ]--\n", file=generated_lua)
+            
+            for macro, rule in macros.items():
+                macro_name = convert_macro_name(macro)
+                lua_rule = rule_to_lua(rule)
+
+                print(get_lua_func(macro_name, lua_rule), file=generated_lua)
+                func_body = f"  if {lua_rule} then\n"
+                func_body += "    return AccessibilityLevel.Normal\n"
+                func_body += "  end\n"
+                print(get_lua_func(macro_name + "_A", "AccessibilityLevel.None", func_body), file=generated_lua)
+
+            rules = {}
+            for node_name, node in data["nodes"].items():
+                func_name = get_function_name(node_name)
+
+                if func_name == None:
+                    continue
+
+                is_start_loc = node_name in reverse_nodes and any([reverse_nodes[node_name] == item.clientKey for item in starts.values()])
+                if 'rules' in node:
+                    lua_rule = parse_rule(f"{reverse_nodes[node_name]} | {node['rules']}" if is_start_loc else node['rules'], func_name)
+                elif is_start_loc:
+                    lua_rule = rule_to_lua(reverse_nodes[node_name])
+                else:
+                    lua_rule = "True"
+
+                rules[func_name] = lua_rule
+            
+            for func_name, rule in rules.items():
+                if (func_name in connections):
+                    print(get_lua_func(func_name, rules[connections[func_name]]), file=generated_lua)
+                else:
+                    print(get_lua_func(func_name, rule), file=generated_lua)
+            
+            for func_name, rule in additional_rules.items():
+                print(get_lua_func(func_name, parse_rule(rule)), file=generated_lua)
 
 
+    def create_connection_json():
+        with open(output_connection_json, "w") as connection_json:
+            output_json = [{"name": "Connections", "children":[]}]
+            children = output_json[0]["children"]
+
+            for node_name, node in data["nodes"].items():
+                func_name = get_function_name(node_name)
+
+                if func_name == None:
+                    continue
+
+                if func_name in nodes_aliases or func_name in region_aliases:
+                    children.append({
+                        "name": func_name,
+                        "access_rules": [f"^${func_name}"]
+                    })
+                elif node_name in reverse_nodes:
+                    access_rules = [f"^${func_name}"]
+                    if any([reverse_nodes[node_name] == item.clientKey for _, item in starts.items()]):
+                        access_rules.append(f"$isSpawn|{reverse_nodes[node_name]}")
+
+                    children.append({
+                        "name": reverse_nodes[node_name],
+                        "access_rules": access_rules
+                    })
+
+            for func_name, _ in additional_rules.items():
+                children.append({
+                    "name": func_name,
+                    "access_rules": [f"^${func_name}"]
+                })
+            
+            json.dump(output_json, connection_json, indent=4)
+
+
+    def update_connection_json():
+        def add_entry_IF(lst, entry_name):
+            for entry in lst:
+                if entry["name"] == entry_name:
+                    return entry
+            
+            lst.append({
+                "name": entry_name,
+                "children": []
+            })
+            return lst[-1]
+
+        connections_accesses = {}
+        with open(output_connection_json, "r") as connection_json:
+            f_content = json.load(connection_json)
+            for entry in f_content[0]["children"]:
+                connections_accesses[entry["name"]] = entry["access_rules"]
+
+        json_output = []
+
+        for c_name, c_access in connections_accesses.items():
+            if c_name in missing_paths:
+                splitted_name = missing_paths[c_name]
+            else:
+                splitted_name = re.split(r"(\d+)", c_access[0][2:], 1)
+                if c_name not in region_aliases:
+                    splitted_name[2] = c_name
+            
+            output_entry = add_entry_IF(json_output, splitted_name[0])
+            output_entry = add_entry_IF(output_entry["children"], splitted_name[1])
+            output_entry["children"].append({
+                "name": splitted_name[2],
+                "access_rules": c_access
+            })
+
+        with open(output_connection_json, "w") as connection_json:
+            json.dump(json_output, connection_json, indent=4)
+
+
+    def update_location_jsons():
+        for json_file_name in os.listdir(locations_folder_path):
+            print(f"Starting to convert {json_file_name}...")
+            full_path = f"{locations_folder_path}/{json_file_name}"
+            f_content = []
+            with open(full_path, "r") as json_file:
+                f_content = json.load(json_file)
+
+            f_locations = f_content[0]["children"]
+
+            for loc in f_locations:
+                has_glitched_logic = False
+                if "access_rules" in loc:
+                    for rule in loc["access_rules"]:
+                        if '[' in rule:
+                            has_glitched_logic = True
+                    
+                    if not has_glitched_logic:
+                        del loc["access_rules"]
+                
+                for section in loc["sections"]:
+                    func_name = get_associated_func(f_content[0]["name"], loc["name"], section["name"])
+
+                    if "access_rules" in section:
+                        section["access_rules"] = list(filter(lambda r : "[" in r, section["access_rules"]))
+                        section["access_rules"].insert(0, func_name)
+                    else:
+                        section["access_rules"] = [ func_name ]
+
+            with open(full_path, "w") as json_file:
+                json.dump(f_content, json_file, indent=4)
+            
+            print(f"Conversion done !")
+
+
+    def add_nodes_path_to_properties():
+        with open(output_connection_json, "r") as connection_json:
+            f_content = json.load(connection_json)
+        
+        loc_path = {}
+        for map in f_content:
+            for sub_map in map["children"]:
+                for location in sub_map["children"]:
+                    combined_name = f'{map["name"]}{sub_map["name"]}{location["name"]}'
+                    loc_name = combined_name if combined_name in region_aliases else location["name"]
+                    loc_path[loc_name] = f'@{map["name"]}/{sub_map["name"]}/{location["name"]}'
+        
+        with open(poptracker_json_path, "r") as properties_json:
+            pop_data = json.load(properties_json)
+        
+        pop_data["nodes_connection_path"] = loc_path
+
+        with open(poptracker_json_path, "w") as properties_json:
+            json.dump(pop_data, properties_json, indent=2)
+
+
+    
+    ######################## GENERATORS CALLS ########################
+    
     # Uncomment to generate lua logic file
-    with open(generated_lua_path, "w") as generated_lua:
-        print(f"--[ Logic was generated from tokenizer script ]--\n", file=generated_lua)
-        
-        for macro, rule in macros.items():
-            macro_name = convert_macro_name(macro)
-            lua_rule = rule_to_lua(rule)
+    create_generated_lua()
 
-            print(get_lua_func(macro_name, lua_rule), file=generated_lua)
-            func_body = f"  if {lua_rule} then\n"
-            func_body += "    return AccessibilityLevel.Normal\n"
-            func_body += "  end\n"
-            print(get_lua_func(macro_name + "_A", "AccessibilityLevel.None", func_body), file=generated_lua)
+    # Uncomment to generate connection json for poptracker ---- OUTDATED
+    # create_connection_json()
 
-        rules = {}
-        for node_name, node in data["nodes"].items():
-            func_name = get_function_name(node_name)
-
-            if func_name == None:
-                continue
-
-            is_start_loc = node_name in reverse_nodes and any([reverse_nodes[node_name] == item.clientKey for item in starts.values()])
-            if 'rules' in node:
-                lua_rule = parse_rule(f"{reverse_nodes[node_name]} | {node['rules']}" if is_start_loc else node['rules'], func_name)
-            elif is_start_loc:
-                lua_rule = rule_to_lua(reverse_nodes[node_name])
-            else:
-                lua_rule = "True"
-
-            rules[func_name] = lua_rule
-        
-        for func_name, rule in rules.items():
-            if (func_name in connections):
-                print(get_lua_func(func_name, rules[connections[func_name]]), file=generated_lua)
-            else:
-                print(get_lua_func(func_name, rule), file=generated_lua)
-        
-        for func_name, rule in additional_rules.items():
-            print(get_lua_func(func_name, parse_rule(rule)), file=generated_lua)
-
-
-    # Uncomment to generate connection json for poptracker
-    # with open(output_connection_json, "w") as connection_json:
-    #     output_json = [{"name": "Connections", "children":[]}]
-    #     children = output_json[0]["children"]
-
-    #     for node_name, node in data["nodes"].items():
-    #         func_name = get_function_name(node_name)
-
-    #         if func_name == None:
-    #             continue
-
-    #         if func_name in nodes_aliases or func_name in region_aliases:
-    #             children.append({
-    #                 "name": func_name,
-    #                 "access_rules": [f"^${func_name}"]
-    #             })
-    #         elif node_name in reverse_nodes:
-    #             access_rules = [f"^${func_name}"]
-    #             if any([reverse_nodes[node_name] == item.clientKey for _, item in starts.items()]):
-    #                 access_rules.append(f"$isSpawn|{reverse_nodes[node_name]}")
-
-    #             children.append({
-    #                 "name": reverse_nodes[node_name],
-    #                 "access_rules": access_rules
-    #             })
-
-    #     for func_name, _ in additional_rules.items():
-    #         children.append({
-    #             "name": func_name,
-    #             "access_rules": [f"^${func_name}"]
-    #         })
-        
-    #     json.dump(output_json, connection_json, indent=4)
-
-
+    # Uncomment to update connections
+    # update_connection_json()
 
     # Uncomment to update location jsons
-    # for json_file_name in os.listdir(locations_folder_path):
-    #     print(f"Starting to convert {json_file_name}...")
-    #     full_path = f"{locations_folder_path}/{json_file_name}"
-    #     f_content = []
-    #     with open(full_path, "r") as json_file:
-    #         f_content = json.load(json_file)
+    # update_location_jsons()
 
-    #     f_locations = f_content[0]["children"]
-
-    #     for loc in f_locations:
-    #         has_glitched_logic = False
-    #         if "access_rules" in loc:
-    #             for rule in loc["access_rules"]:
-    #                 if '[' in rule:
-    #                     has_glitched_logic = True
-                
-    #             if not has_glitched_logic:
-    #                 del loc["access_rules"]
-            
-    #         for section in loc["sections"]:
-    #             func_name = get_associated_func(f_content[0]["name"], loc["name"], section["name"])
-
-    #             if "access_rules" in section:
-    #                 section["access_rules"] = list(filter(lambda r : "[" in r, section["access_rules"]))
-    #                 section["access_rules"].insert(0, func_name)
-    #             else:
-    #                 section["access_rules"] = [ func_name ]
-
-    #     with open(full_path, "w") as json_file:
-    #         json.dump(f_content, json_file, indent=4)
-        
-    #     print(f"Conversion done !")
+    # add_nodes_path_to_properties()
